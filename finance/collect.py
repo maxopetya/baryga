@@ -7,7 +7,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from .collectors import collect_edisclosure, collect_moex, collect_rss
+from .collectors import collect_edisclosure, collect_moex, collect_rss, collect_telegram_web
 from .config import NEWS_WINDOW_HOURS
 from .storage import connect, init_db, upsert_news
 from .tickers import refresh as refresh_tickers
@@ -50,6 +50,18 @@ async def _run(window_hours: int, refresh_ticks: bool) -> dict:
         ed_items = []
     ins, dup = upsert_news(ed_items)
     stats["edisclosure"] = {"fetched": len(ed_items), "new": ins, "dup": dup}
+
+    # Telegram public web
+    try:
+        tg_map = await collect_telegram_web(since_dt)
+    except Exception as e:
+        log.warning("telegram_web collector failed: %s", e)
+        tg_map = {}
+    for src, items in tg_map.items():
+        for it in items:
+            it["source"] = src
+        ins, dup = upsert_news(items)
+        stats[src] = {"fetched": len(items), "new": ins, "dup": dup}
 
     # запись run
     with connect() as conn:

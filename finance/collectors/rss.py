@@ -23,6 +23,8 @@ RSS_SOURCES: dict[str, str] = {
     "kommersant_b": "https://www.kommersant.ru/RSS/section-business.xml",
     "kommersant_f": "https://www.kommersant.ru/RSS/section-finance.xml",
     "prime":        "https://1prime.ru/export/rss2/index.xml",
+    "smart_lab":    "https://smart-lab.ru/rss/",
+    "investing_ru": "https://ru.investing.com/rss/news.rss",
 }
 
 
