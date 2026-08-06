@@ -539,14 +539,14 @@ async def build_briefing(day: date | None = None) -> str:
         rows = []
         for r in ups:
             t = r["secid"]
-            overnight = r["expected_open_pct"]
+            effective = r["effective_pct"]  # прог модели + news_alpha
             morn_ = r.get("morning_pct")
             alpha = r.get("news_alpha", 0.0)
             v = vol_of(t)
-            status, conf = _reinforce_status(overnight, morn_, v)
+            status, conf = _reinforce_status(effective, morn_, v)
             vf = _vol_flag(morn_vol_ratio.get(t))
             emoji = "🟢" if status == "усилено" else ""
-            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji, alpha))
+            rows.append(_fmt_reinforced(t, effective, morn_, status, conf, vf, emoji, alpha))
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
     else:
         lines.append("<b>Топ вверх</b>")
@@ -559,14 +559,14 @@ async def build_briefing(day: date | None = None) -> str:
         rows = []
         for r in downs:
             t = r["secid"]
-            overnight = r["expected_open_pct"]
+            effective = r["effective_pct"]
             morn_ = r.get("morning_pct")
             alpha = r.get("news_alpha", 0.0)
             v = vol_of(t)
-            status, conf = _reinforce_status(overnight, morn_, v)
+            status, conf = _reinforce_status(effective, morn_, v)
             vf = _vol_flag(morn_vol_ratio.get(t))
             emoji = "🟢" if status == "усилено" else ""
-            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji, alpha))
+            rows.append(_fmt_reinforced(t, effective, morn_, status, conf, vf, emoji, alpha))
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
         lines.append("")
 
@@ -621,8 +621,8 @@ async def build_briefing(day: date | None = None) -> str:
             lines.append(f"{arrow} <b>{short} ({n['ticker']})</b>: {title} <a href=\"{url}\">{src_name}</a>")
         lines.append("")
 
-    lines.append("<i>Числа: 1-е — прогноз модели, 2-е — уже случившаяся утренняя сессия.</i>")
-    lines.append("<i>Эмодзи: 🟢 усилено, 📰 сильная новость учтена в ранге, 🔥/⬆️/⬇️ объём утра.</i>")
+    lines.append("<i>Числа: 1-е — прогноз (модель + новостной эффект), 2-е — утренняя сессия (факт).</i>")
+    lines.append("<i>Эмодзи: 🟢 утро усилило прогноз, 📰 в прогнозе учтён новостной эффект, 🔥/⬆️/⬇️ объём утра.</i>")
     lines.append("Не является инвестиционной рекомендацией.")
 
     return "\n".join(lines)
