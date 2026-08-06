@@ -38,35 +38,55 @@ TICKER_HIST_URL = (
 
 
 async def _fetch_ticker_bars(secid: str, since: date, until: date, sem: asyncio.Semaphore) -> list[Bar]:
+    """Пагинируем MOEX ISS history (PAGESIZE=100)."""
     async with sem, client() as c:
-        r = await c.get(
-            TICKER_HIST_URL.format(secid=secid),
-            params={
-                "from": since.isoformat(),
-                "till": until.isoformat(),
-                "iss.meta": "off",
-                "iss.only": "history",
-                "history.columns": "TRADEDATE,OPEN,HIGH,LOW,CLOSE",
-            },
-        )
-        if r.status_code != 200:
-            return []
-        d = r.json().get("history", {})
-    cols = d.get("columns", [])
+        all_rows: list[list] = []
+        cols: list[str] = []
+        start = 0
+        while True:
+            r = await c.get(
+                TICKER_HIST_URL.format(secid=secid),
+                params={
+                    "from": since.isoformat(),
+                    "till": until.isoformat(),
+                    "iss.meta": "off",
+                    "iss.only": "history",
+                    "history.columns": "TRADEDATE,OPEN,HIGH,LOW,CLOSE",
+                    "start": str(start),
+                },
+            )
+            if r.status_code != 200:
+                break
+            d = r.json().get("history", {})
+            page_cols = d.get("columns", [])
+            if not page_cols:
+                break
+            if not cols:
+                cols = page_cols
+            page = d.get("data", [])
+            if not page:
+                break
+            all_rows.extend(page)
+            if len(page) < 100:
+                break
+            start += len(page)
+            if start > 10000:
+                break
+
     if not cols:
         return []
     ci = {n: i for i, n in enumerate(cols)}
     bars: list[Bar] = []
-    for row in d.get("data", []):
-        c = row[ci.get("CLOSE", -1)] if "CLOSE" in ci else None
-        if c is None:
+    for row in all_rows:
+        cval = row[ci.get("CLOSE", -1)] if "CLOSE" in ci else None
+        if cval is None:
             continue
         bars.append(Bar(
             date=row[ci["TRADEDATE"]],
             open=row[ci.get("OPEN", -1)] if "OPEN" in ci else None,
             high=row[ci.get("HIGH", -1)] if "HIGH" in ci else None,
             low=row[ci.get("LOW", -1)] if "LOW" in ci else None,
-            close=c,
+            close=cval,
         ))
     return bars
 

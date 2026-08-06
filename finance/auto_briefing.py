@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import MSK, OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from .morning import morning_for
 from .prognosis import factor_changes_overnight, overnight_predictor_changes, rank_expected_moves
 from .rules import _COMPILED as RULE_PATTERNS
 from .storage import connect
@@ -171,6 +172,53 @@ def _confidence(exp_pct: float, vol_pct: float) -> str:
     return "низкая"
 
 
+def _reinforce_status(overnight_pct: float, morning_pct: float | None, vol_pct: float) -> tuple[str, str]:
+    """Возвращает (метка_статуса, уверенность).
+
+    Логика:
+      подтв.     — overnight и утро в одну сторону, амплитуды сопоставимы
+      усилено    — та же сторона, утро значительно сильнее (в 2× или больше)
+      конфликт   — знаки противоположны (доверяем утру, но confidence падает)
+      только утро — overnight ≈ 0, утро выделяется
+      только модель — утра нет вообще
+      нейтр.     — оба слабые
+    """
+    NOISE = 0.15  # % — ниже считаем «нулём»
+    if morning_pct is None:
+        # доверяем только overnight
+        conf = _confidence(overnight_pct, vol_pct)
+        if abs(overnight_pct) < NOISE:
+            return "нейтр.", "низкая"
+        return "только модель", conf
+
+    o_signal = abs(overnight_pct) >= NOISE
+    m_signal = abs(morning_pct) >= NOISE
+    if not o_signal and not m_signal:
+        return "нейтр.", "низкая"
+    if not o_signal:
+        return "только утро", _confidence(morning_pct, vol_pct)
+    if not m_signal:
+        return "только модель", _confidence(overnight_pct, vol_pct)
+
+    same_dir = (overnight_pct * morning_pct) > 0
+    ratio_m_to_o = abs(morning_pct) / max(abs(overnight_pct), 0.01)
+    if same_dir:
+        conf = _confidence(morning_pct, vol_pct)
+        # подтверждённый сигнал заслуживает бонус к уверенности
+        if conf == "низкая" and abs(morning_pct) / max(vol_pct, 0.01) >= 0.3:
+            conf = "средняя"
+        elif conf == "средняя" and abs(morning_pct) / max(vol_pct, 0.01) >= 0.6:
+            conf = "высокая"
+        label = "усилено" if ratio_m_to_o >= 2.0 else "подтв."
+        return label, conf
+    else:
+        # знаки не совпадают: доверяем утру (это уже случившийся факт), но подтверждения нет
+        conf = _confidence(morning_pct, vol_pct)
+        # снижаем уверенность на одну ступень
+        step = {"высокая": "средняя", "средняя": "низкая", "низкая": "низкая"}
+        return "конфликт", step[conf]
+
+
 def _mood(imoex_pct: float | None, overnight_bright: bool) -> str:
     if imoex_pct is None:
         return "нейтральное"
@@ -181,11 +229,11 @@ def _mood(imoex_pct: float | None, overnight_bright: bool) -> str:
     return "нейтральное"
 
 
-def _diversified_pick(ranked: list, sector_of, max_per_sector: int, limit: int, positive_only: bool):
+def _diversified_pick(ranked: list, sector_of, max_per_sector: int, limit: int, positive_only: bool, key: str = "expected_open_pct"):
     per_sec: dict[str, int] = {}
     picked = []
     for r in ranked:
-        exp = r["expected_open_pct"]
+        exp = r[key]
         if positive_only and exp <= 0:
             break
         if not positive_only and exp >= 0:
@@ -198,6 +246,59 @@ def _diversified_pick(ranked: list, sector_of, max_per_sector: int, limit: int, 
         if len(picked) >= limit:
             break
     return picked
+
+
+MOEX_TECHNICAL_PATTERNS = (
+    "Об изменении", "О порядке", "Дополнительные условия", "О регистрации",
+    "дискретный аукцион", "изменены значения", "приостановке торгов",
+    "О приостановке", "О возобновлении", "заявок на", "уровня листинга",
+    "торгового дня", "депозитный аукцион", "фиксингов",
+)
+
+
+def _is_technical_moex(title: str) -> bool:
+    if not title:
+        return False
+    for p in MOEX_TECHNICAL_PATTERNS:
+        if p in title:
+            return True
+    return False
+
+
+def _find_news_for_tickers(tickers: set[str], day: date) -> dict[str, dict | None]:
+    """Ищем упоминания тикеров в новостях за последние 30 ч.
+    Возвращаем {ticker: {title, url}} или {ticker: None} если ничего вменяемого не нашли.
+    """
+    prev = day - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    since = datetime.combine(prev, datetime.min.time(), MSK).replace(hour=6)
+    until = datetime.combine(day, datetime.min.time(), MSK).replace(hour=10, minute=0)
+    since_iso = since.astimezone(timezone.utc).isoformat(timespec="seconds")
+    until_iso = until.astimezone(timezone.utc).isoformat(timespec="seconds")
+    result: dict[str, dict] = {}
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT title, url, tickers FROM news WHERE published_at >= ? AND published_at < ? "
+            "ORDER BY published_at DESC",
+            (since_iso, until_iso),
+        ).fetchall()
+    for r in rows:
+        try:
+            row_tickers = set(json.loads(r["tickers"] or "[]"))
+        except json.JSONDecodeError:
+            continue
+        match = tickers & row_tickers
+        if not match:
+            continue
+        if _is_technical_moex(r["title"]):
+            continue
+        for tk in match:
+            if tk in result:
+                continue
+            result[tk] = {"title": r["title"], "url": r["url"] or ""}
+    # Для тикеров без новости оставляем метку None (чтобы в брифинге видеть «нет данных»)
+    return {tk: result.get(tk) for tk in tickers}
 
 
 def _fetch_strong_news(day: date) -> list[dict]:
@@ -258,6 +359,35 @@ def _fmt_row(name: str, ticker: str, pct: float, driver: str, conf: str,
     return f"{name:<{name_w}}{('(' + ticker + ')'):<{tick_w}}{pct:+.1f}%  — {driver} ({conf})"
 
 
+def _vol_flag(vol_ratio: float | None) -> str:
+    """Индикатор объёма утренней сессии относительно вчерашнего дневного.
+    Утренняя сессия ~3ч из 9-часовой основной = ~33% времени.
+    """
+    if vol_ratio is None:
+        return ""
+    if vol_ratio >= 0.80:
+        return "🔥"
+    if vol_ratio >= 0.40:
+        return "⬆️"
+    if vol_ratio >= 0.20:
+        return ""
+    return "⬇️"
+
+
+def _fmt_reinforced(ticker: str, overnight_pct: float, morning_pct: float | None,
+                     status: str, conf: str, vol_flag: str = "",
+                     status_emoji: str = "") -> str:
+    """Формат: TICKER  ±прог  ±утро  статус (уверенность) [эмодзи в конце]"""
+    tk = f"{ticker:<6s}"
+    if morning_pct is None:
+        signals = f"{overnight_pct:+5.1f}      "
+    else:
+        signals = f"{overnight_pct:+5.1f} {morning_pct:+5.1f}"
+    emojis = " ".join(x for x in (status_emoji, vol_flag) if x)
+    trailer = f"  {emojis}" if emojis else ""
+    return f"{tk} {signals}  {status:<12s} ({conf}){trailer}"
+
+
 async def build_briefing(day: date | None = None) -> str:
     day = day or datetime.now(MSK).date()
 
@@ -265,10 +395,37 @@ async def build_briefing(day: date | None = None) -> str:
     overn = det["overnight_inputs_pct"]
     preds = det["predictions"]
     imoex_pct = preds.get("IMOEX", {}).get("expected_pct")
-    # overnight-фон «бычий», если Nikkei или SPX или BRENT_LIVE или GOLD_LIVE > 1%
     overnight_bright = any(overn.get(k, 0) > 1.0 for k in ("SPX", "NIKKEI", "GOLD_LIVE", "BRENT_LIVE"))
 
     ranks = rank_expected_moves(fc)
+
+    # === Морнинг-сессия для ВСЕХ тикеров ===
+    all_ids = [r["secid"] for r in ranks]
+    morn = {}
+    morn_vol_ratio: dict[str, float | None] = {}
+    try:
+        morn_stats = await morning_for(all_ids, day, concurrency=6)
+        for t, s in morn_stats.items():
+            if s.morn_vs_prev_pct is not None:
+                morn[t] = s.morn_vs_prev_pct
+                morn_vol_ratio[t] = s.vol_ratio
+        log.info("Утренняя сессия: %d бумаг из %d торговались", len(morn), len(all_ids))
+    except Exception as e:
+        log.warning("morning fetch failed: %s", e)
+
+    # Блендим: если есть морнинг, final = 0.8*morn + 0.2*model; иначе final = model
+    W_MORN = 0.8
+    for r in ranks:
+        m = morn.get(r["secid"])
+        if m is not None:
+            r["morning_pct"] = m
+            r["final_pct"] = W_MORN * m + (1 - W_MORN) * r["expected_open_pct"]
+        else:
+            r["morning_pct"] = None
+            r["final_pct"] = r["expected_open_pct"]
+
+    # Пересортируем ranks по final_pct
+    ranks.sort(key=lambda x: x["final_pct"], reverse=True)
 
     with connect() as conn:
         def sector_of(t):
@@ -278,9 +435,9 @@ async def build_briefing(day: date | None = None) -> str:
             r = conn.execute("SELECT vol_daily FROM ticker_vol WHERE secid=?", (t,)).fetchone()
             return (r["vol_daily"] or 0) * 100 if r else 0
 
-        ups = _diversified_pick(ranks, sector_of, max_per_sector=4, limit=15, positive_only=True)
-        downs_all = sorted(ranks, key=lambda x: x["expected_open_pct"])  # самые отрицательные вперёд
-        downs = _diversified_pick(downs_all, sector_of, max_per_sector=3, limit=6, positive_only=False)
+        ups = _diversified_pick(ranks, sector_of, max_per_sector=4, limit=15, positive_only=True, key="final_pct")
+        downs_all = sorted(ranks, key=lambda x: x["final_pct"])
+        downs = _diversified_pick(downs_all, sector_of, max_per_sector=3, limit=6, positive_only=False, key="final_pct")
 
     strong_news = _fetch_strong_news(day)
 
@@ -303,33 +460,66 @@ async def build_briefing(day: date | None = None) -> str:
         rows = []
         for r in ups:
             t = r["secid"]
-            exp = r["expected_open_pct"]
+            overnight = r["expected_open_pct"]
+            morn_ = r.get("morning_pct")
             v = vol_of(t)
-            conf = _confidence(exp, v)
-            driver = _driver_label(r, sector_of(t))
-            rows.append(_fmt_row(_short(t), t, exp, driver, conf))
+            status, conf = _reinforce_status(overnight, morn_, v)
+            vf = _vol_flag(morn_vol_ratio.get(t))
+            emoji = "🟢" if status == "усилено" else ""
+            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji))
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
     else:
         lines.append("<b>Топ вверх</b>")
-        lines.append("Модель бычьих кандидатов не даёт. Overnight-фон:"
-                     f" Nikkei {ni:+.1f}%, золото {gd:+.1f}% — реальность может разойтись с моделью.")
+        lines.append(f"Ни модели, ни утренняя сессия не дают бычьих сигналов. Overnight: Nikkei {ni:+.1f}%, золото {gd:+.1f}%.")
     lines.append("")
 
-    # Топ вниз — показываем только если IMOEX прогноз явно отрицательный
-    if imoex_pct is not None and imoex_pct <= -0.15 and downs:
-        lines.append("<b>Топ вниз (модель)</b>")
+    strong_downs = [d for d in downs if d["final_pct"] <= -0.3]
+    if len(strong_downs) >= 3:
+        lines.append("<b>Топ вниз</b>")
         rows = []
         for r in downs:
             t = r["secid"]
-            exp = r["expected_open_pct"]
+            overnight = r["expected_open_pct"]
+            morn_ = r.get("morning_pct")
             v = vol_of(t)
-            conf = _confidence(exp, v)
-            driver = _driver_label(r, sector_of(t))
-            rows.append(_fmt_row(_short(t), t, exp, driver, conf))
+            status, conf = _reinforce_status(overnight, morn_, v)
+            vf = _vol_flag(morn_vol_ratio.get(t))
+            emoji = "🟢" if status == "усилено" else ""
+            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji))
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
         lines.append("")
 
-    # Отдельно — новости
+    # Разбор новостей: только для реально больших ходов (>2%)
+    big_movers = set()
+    for r in ups[:6]:
+        m = r.get("morning_pct")
+        if m is not None and m >= 2.0:
+            big_movers.add(r["secid"])
+    for r in downs[:6]:
+        m = r.get("morning_pct")
+        if m is not None and m <= -2.0:
+            big_movers.add(r["secid"])
+    if big_movers:
+        move_news = _find_news_for_tickers(big_movers, day)
+        lines.append("<b>Что стоит за движением</b>")
+        src_map = {
+            "www.kommersant.ru": "Ъ", "www.rbc.ru": "РБК", "www.vedomosti.ru": "Вед",
+            "www.interfax.ru": "И-факс", "1prime.ru": "Прайм", "www.moex.com": "MOEX",
+        }
+        for tk in sorted(big_movers, key=lambda t: abs(morn.get(t, 0) or 0), reverse=True):
+            morn_val = morn.get(tk)
+            move_hint = f"{morn_val:+.1f}%" if morn_val is not None else "?"
+            short_name = _short(tk)
+            item = move_news.get(tk)
+            if item:
+                src = item["url"].split("/")[2] if item["url"].startswith("http") else "src"
+                src_name = src_map.get(src, src)
+                lines.append(f"• <b>{short_name} ({tk})</b> {move_hint} — {item['title'][:130]} <a href=\"{item['url']}\">{src_name}</a>")
+            else:
+                lines.append(f"• <b>{short_name} ({tk})</b> {move_hint} — <i>новостей в базе нет, стоит проверить руками</i>")
+        lines.append("")
+
+    # Отдельно — pre-open новости с сильными тегами (уже верифицированы заголовком)
     if strong_news:
         lines.append("<b>Отдельно</b>")
         for n in strong_news:
@@ -350,7 +540,8 @@ async def build_briefing(day: date | None = None) -> str:
             lines.append(f"{arrow} <b>{short} ({n['ticker']})</b>: {title} <a href=\"{url}\">{src_name}</a>")
         lines.append("")
 
-    lines.append("Уверенность — про направление, не про амплитуду. % — базовое ожидание модели.")
+    lines.append("<i>Числа: 1-е — прогноз модели, 2-е — уже случившаяся утренняя сессия.</i>")
+    lines.append("<i>Статус: подтв./усилено = морнинг подтверждает модель, конфликт = знаки не сошлись, доверяем утру.</i>")
     lines.append("Не является инвестиционной рекомендацией.")
 
     return "\n".join(lines)

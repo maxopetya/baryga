@@ -96,34 +96,53 @@ class Series:
 
 
 async def _fetch_moex_history(cfg: dict, since: date, until: date) -> list[Bar]:
+    """MOEX ISS history с пагинацией. PAGESIZE=100, идём по start= пока страница полная."""
     engine, market, board, secid = cfg["engine"], cfg["market"], cfg.get("board"), cfg["secid"]
     url = ISS_HISTORY.format(engine=engine, market=market)
     if board:
         url += ISS_HISTORY_BOARD.format(board=board)
     url += ISS_HISTORY_SEC.format(secid=secid)
-    params = {
-        "from": since.isoformat(),
-        "till": until.isoformat(),
-        "iss.meta": "off",
-        "iss.only": "history",
-    }
+
+    all_rows: list[list] = []
+    cols: list[str] = []
+    start = 0
     async with client() as c:
-        r = await c.get(url, params=params)
-        r.raise_for_status()
-        d = r.json().get("history", {})
-    cols = d.get("columns", [])
+        while True:
+            params = {
+                "from": since.isoformat(),
+                "till": until.isoformat(),
+                "iss.meta": "off",
+                "iss.only": "history",
+                "start": str(start),
+            }
+            r = await c.get(url, params=params)
+            r.raise_for_status()
+            d = r.json().get("history", {})
+            page_cols = d.get("columns", [])
+            if not page_cols:
+                break
+            if not cols:
+                cols = page_cols
+            page = d.get("data", [])
+            if not page:
+                break
+            all_rows.extend(page)
+            if len(page) < 100:  # PAGESIZE MOEX ISS = 100
+                break
+            start += len(page)
+            if start > 10000:  # safety
+                break
+
     if not cols:
         return []
     idx = {n: i for i, n in enumerate(cols)}
     bars: list[Bar] = []
-    for row in d.get("data", []):
-        # currency SELT возвращает несколько board'ов на дату — берём только запрошенный
+    for row in all_rows:
         if board and "BOARDID" in idx and row[idx["BOARDID"]] != board:
             continue
         date_s = row[idx.get("TRADEDATE", 1)]
         get = lambda k: row[idx[k]] if k in idx else None
         bars.append(Bar(date=date_s, open=get("OPEN"), high=get("HIGH"), low=get("LOW"), close=get("CLOSE")))
-    # dedupe по датам (мало ли повторов) + sort
     dedup: dict[str, Bar] = {}
     for b in bars:
         dedup[b.date] = b
@@ -217,7 +236,9 @@ async def collect_series(days_back: int = 30, as_of: date | None = None) -> dict
     # Yahoo
     async def one_yahoo(name: str, sym: str) -> tuple[str, Series]:
         # выбираем ближайший диапазон Yahoo к нашему days_back
-        rng = "1mo" if days_back <= 30 else ("3mo" if days_back <= 90 else "6mo" if days_back <= 180 else "1y")
+        rng = ("1mo" if days_back <= 30 else "3mo" if days_back <= 90 else
+               "6mo" if days_back <= 180 else "1y" if days_back <= 365 else
+               "2y" if days_back <= 730 else "5y")
         bars = await _fetch_yahoo(sym, rng)
         # обрезаем по дате запроса
         bars = [b for b in bars if b.date <= as_of.isoformat()]
