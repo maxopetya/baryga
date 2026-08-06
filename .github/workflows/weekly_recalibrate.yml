@@ -1,0 +1,46 @@
+name: Weekly recalibration
+
+on:
+  schedule:
+    # По воскресеньям в 20:00 МСК = 17:00 UTC. Пересчитываем бэты + регрессию.
+    - cron: "0 17 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recalibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+
+      - name: Refresh tickers universe
+        run: python -X utf8 -m finance.tickers
+
+      - name: Recalibrate ticker betas (180 days)
+        run: python -X utf8 -m finance.calibration --days 180
+
+      - name: Refit overnight regression (180 days)
+        run: python -X utf8 -m finance.regression --days 180
+
+      - name: Commit recalibrated DB
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions Bot"
+          git add data/finance.db
+          if git diff --cached --quiet; then
+            echo "БД не изменилась."
+          else
+            git commit -m "chore(calibration): weekly refit [skip ci]"
+            git push
+          fi

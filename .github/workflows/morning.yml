@@ -1,0 +1,65 @@
+name: Morning briefing
+
+on:
+  schedule:
+    # 06:30 UTC = 09:30 МСК, пн-пт. GitHub cron может задерживать до 10-15 мин.
+    - cron: "30 6 * * 1-5"
+  workflow_dispatch:  # запуск руками из вкладки Actions
+
+concurrency:
+  group: morning-briefing
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # чтобы коммитить обновлённую БД
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONIOENCODING: utf-8
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+      NEWS_WINDOW_HOURS: "16"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Collect news + factors
+        run: python -X utf8 -m finance.collect --hours ${NEWS_WINDOW_HOURS} --no-tickers
+
+      - name: Generate and send briefing
+        run: python -X utf8 -m finance.auto_briefing
+
+      - name: Commit updated DB
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions Bot"
+          git add data/finance.db
+          if git diff --cached --quiet; then
+            echo "БД не изменилась — коммит пропускаем."
+          else
+            git commit -m "chore(db): update news + factors [skip ci]"
+            git push
+          fi
+
+      - name: Upload briefing as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: briefing-${{ github.run_id }}
+          path: output/daily_briefing_*.md
+          retention-days: 14
