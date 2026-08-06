@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import MSK, OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from .matcher import match as match_tickers
 from .morning import morning_for
 from .prognosis import factor_changes_overnight, overnight_predictor_changes, rank_expected_moves
 from .rules import _COMPILED as RULE_PATTERNS
@@ -128,6 +129,21 @@ SHORT_NAMES = {
 # ── Сильные новостные теги, дающие «высокую» уверенность в направлении ──
 STRONG_BULLISH_TAGS = {"dividends", "special_div", "buyback", "sanctions_lift", "redomicil"}
 STRONG_BEARISH_TAGS = {"bond_default", "sanctions"}
+
+# News-alpha — сколько % ожидаем на открытии из-за данного типа события.
+# Величины — грубые исторические оценки, не претендуют на точность, но задают
+# правильный порядок: дефолт двигает бумагу гораздо сильнее, чем объявление дивов.
+NEWS_ALPHA_PCT: dict[str, float] = {
+    "bond_default":   -12.0,
+    "sanctions":       -6.0,
+    "sanctions_lift":  +5.0,
+    "special_div":     +6.0,
+    "dividends":       +3.0,
+    "buyback":         +3.0,
+    "redomicil":       +2.0,
+    "mna":              0.0,   # неопределённое направление
+    "earnings":         0.0,   # знак зависит от того, лучше/хуже консенсуса
+}
 
 
 def _short(secid: str) -> str:
@@ -301,6 +317,57 @@ def _find_news_for_tickers(tickers: set[str], day: date) -> dict[str, dict | Non
     return {tk: result.get(tk) for tk in tickers}
 
 
+def _news_alpha_map(day: date) -> dict[str, float]:
+    """Event-driven alpha per ticker из pre-open новостей.
+
+    Правила чтобы избежать cross-contamination:
+      1. Тег события подтверждён в ЗАГОЛОВКЕ (не только в теле)
+      2. Alpha применяется только к тикерам, тоже упомянутым в ЗАГОЛОВКЕ
+         (иначе Smart-Lab-статья про DIAS с побочным упоминанием EUTR в теле
+          не должна давать EUTR-у alpha от «дивидендов»)
+      3. Если по одному тикеру много новостей — берём самый сильный по модулю alpha
+    """
+    prev = day - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    since = datetime.combine(prev, datetime.min.time(), MSK).replace(hour=18, minute=45)
+    until = datetime.combine(day, datetime.min.time(), MSK).replace(hour=10, minute=0)
+    since_iso = since.astimezone(timezone.utc).isoformat(timespec="seconds")
+    until_iso = until.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    tag_rx = {tag: rx for tag, rx, _ in RULE_PATTERNS}
+    alphas: dict[str, float] = {}
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT title, tickers, tags FROM news "
+            "WHERE published_at >= ? AND published_at < ? ORDER BY published_at DESC",
+            (since_iso, until_iso),
+        ).fetchall()
+    for r in rows:
+        try:
+            row_tags = json.loads(r["tags"] or "[]")
+        except json.JSONDecodeError:
+            continue
+        if not row_tags:
+            continue
+        title = r["title"] or ""
+        # тег обязан быть в ЗАГОЛОВКЕ, иначе — это шум из тела
+        confirmed = [t for t in row_tags if tag_rx.get(t) and tag_rx[t].search(title)]
+        tag_alphas = [NEWS_ALPHA_PCT.get(t, 0.0) for t in confirmed]
+        tag_alphas = [a for a in tag_alphas if a != 0]
+        if not tag_alphas:
+            continue
+        alpha = max(tag_alphas, key=abs)
+        # тикер применения обязан быть в ЗАГОЛОВКЕ, не в теле
+        title_tickers = match_tickers(title)
+        if not title_tickers:
+            continue
+        for tk in title_tickers:
+            if abs(alpha) > abs(alphas.get(tk, 0.0)):
+                alphas[tk] = alpha
+    return alphas
+
+
 def _fetch_strong_news(day: date) -> list[dict]:
     """Ищем pre-open новости с сильным тегом И привязкой к конкретному тикеру."""
     # окно: 18:45 МСК предыдущего дня → 10:00 МСК day
@@ -376,15 +443,21 @@ def _vol_flag(vol_ratio: float | None) -> str:
 
 def _fmt_reinforced(ticker: str, overnight_pct: float, morning_pct: float | None,
                      status: str, conf: str, vol_flag: str = "",
-                     status_emoji: str = "") -> str:
-    """Формат: TICKER  ±прог  ±утро  статус (уверенность) [эмодзи в конце]"""
+                     status_emoji: str = "", news_alpha: float = 0.0) -> str:
+    """TICKER  ±прог  ±утро  статус (уверенность) [эмодзи+📰 в конце]"""
     tk = f"{ticker:<6s}"
     if morning_pct is None:
         signals = f"{overnight_pct:+5.1f}      "
     else:
         signals = f"{overnight_pct:+5.1f} {morning_pct:+5.1f}"
-    emojis = " ".join(x for x in (status_emoji, vol_flag) if x)
-    trailer = f"  {emojis}" if emojis else ""
+    parts: list[str] = []
+    if status_emoji:
+        parts.append(status_emoji)
+    if abs(news_alpha) >= 1.0:
+        parts.append("📰")
+    if vol_flag:
+        parts.append(vol_flag)
+    trailer = f"  {' '.join(parts)}" if parts else ""
     return f"{tk} {signals}  {status:<12s} ({conf}){trailer}"
 
 
@@ -413,18 +486,25 @@ async def build_briefing(day: date | None = None) -> str:
     except Exception as e:
         log.warning("morning fetch failed: %s", e)
 
-    # Блендим: если есть морнинг, final = 0.8*morn + 0.2*model; иначе final = model
+    # === News-alpha: применяем event-driven буст ДО блендинга с морнингом ===
+    news_alphas = _news_alpha_map(day)
+    for r in ranks:
+        alpha = news_alphas.get(r["secid"], 0.0)
+        r["news_alpha"] = alpha
+        r["effective_pct"] = r["expected_open_pct"] + alpha
+
+    # Блендинг с морнингом: final = 0.8*morn + 0.2*effective (когда есть морнинг)
+    # Морнинг — уже случившийся факт, поэтому он должен доминировать.
     W_MORN = 0.8
     for r in ranks:
         m = morn.get(r["secid"])
         if m is not None:
             r["morning_pct"] = m
-            r["final_pct"] = W_MORN * m + (1 - W_MORN) * r["expected_open_pct"]
+            r["final_pct"] = W_MORN * m + (1 - W_MORN) * r["effective_pct"]
         else:
             r["morning_pct"] = None
-            r["final_pct"] = r["expected_open_pct"]
+            r["final_pct"] = r["effective_pct"]
 
-    # Пересортируем ranks по final_pct
     ranks.sort(key=lambda x: x["final_pct"], reverse=True)
 
     with connect() as conn:
@@ -454,7 +534,6 @@ async def build_briefing(day: date | None = None) -> str:
     lines.append(f"Настроение {mood} · США {sp:+.1f}% · золото {gd:+.1f}% · нефть {br:+.1f}% · Nikkei {ni:+.1f}%")
     lines.append("")
 
-    # Топ вверх
     if ups:
         lines.append(f"<b>Топ-{len(ups)} вверх (≤4 на сектор)</b>")
         rows = []
@@ -462,11 +541,12 @@ async def build_briefing(day: date | None = None) -> str:
             t = r["secid"]
             overnight = r["expected_open_pct"]
             morn_ = r.get("morning_pct")
+            alpha = r.get("news_alpha", 0.0)
             v = vol_of(t)
             status, conf = _reinforce_status(overnight, morn_, v)
             vf = _vol_flag(morn_vol_ratio.get(t))
             emoji = "🟢" if status == "усилено" else ""
-            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji))
+            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji, alpha))
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
     else:
         lines.append("<b>Топ вверх</b>")
@@ -481,11 +561,12 @@ async def build_briefing(day: date | None = None) -> str:
             t = r["secid"]
             overnight = r["expected_open_pct"]
             morn_ = r.get("morning_pct")
+            alpha = r.get("news_alpha", 0.0)
             v = vol_of(t)
             status, conf = _reinforce_status(overnight, morn_, v)
             vf = _vol_flag(morn_vol_ratio.get(t))
             emoji = "🟢" if status == "усилено" else ""
-            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji))
+            rows.append(_fmt_reinforced(t, overnight, morn_, status, conf, vf, emoji, alpha))
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
         lines.append("")
 
@@ -541,7 +622,7 @@ async def build_briefing(day: date | None = None) -> str:
         lines.append("")
 
     lines.append("<i>Числа: 1-е — прогноз модели, 2-е — уже случившаяся утренняя сессия.</i>")
-    lines.append("<i>Статус: подтв./усилено = морнинг подтверждает модель, конфликт = знаки не сошлись, доверяем утру.</i>")
+    lines.append("<i>Эмодзи: 🟢 усилено, 📰 сильная новость учтена в ранге, 🔥/⬆️/⬇️ объём утра.</i>")
     lines.append("Не является инвестиционной рекомендацией.")
 
     return "\n".join(lines)
