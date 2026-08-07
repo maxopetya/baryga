@@ -24,7 +24,7 @@ from .matcher import match as match_tickers
 from .morning import morning_for
 from .prognosis import factor_changes_overnight, overnight_predictor_changes, rank_expected_moves
 from .rules import _COMPILED as RULE_PATTERNS
-from .storage import connect
+from .storage import connect, init_db
 from .telegram_send import send_text
 
 log = logging.getLogger("auto_briefing")
@@ -462,6 +462,7 @@ def _fmt_reinforced(ticker: str, overnight_pct: float, morning_pct: float | None
 
 
 async def build_briefing(day: date | None = None) -> str:
+    init_db()  # обеспечивает наличие briefing_predictions
     day = day or datetime.now(MSK).date()
 
     fc, det = await factor_changes_overnight(day)
@@ -534,12 +535,15 @@ async def build_briefing(day: date | None = None) -> str:
     lines.append(f"Настроение {mood} · США {sp:+.1f}% · золото {gd:+.1f}% · нефть {br:+.1f}% · Nikkei {ni:+.1f}%")
     lines.append("")
 
+    day_iso = day.isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    saved_predictions: list[dict] = []
     if ups:
         lines.append(f"<b>Топ-{len(ups)} вверх (≤4 на сектор)</b>")
         rows = []
         for r in ups:
             t = r["secid"]
-            effective = r["effective_pct"]  # прог модели + news_alpha
+            effective = r["effective_pct"]
             morn_ = r.get("morning_pct")
             alpha = r.get("news_alpha", 0.0)
             v = vol_of(t)
@@ -547,6 +551,13 @@ async def build_briefing(day: date | None = None) -> str:
             vf = _vol_flag(morn_vol_ratio.get(t))
             emoji = "🟢" if status == "усилено" else ""
             rows.append(_fmt_reinforced(t, effective, morn_, status, conf, vf, emoji, alpha))
+            saved_predictions.append({
+                "day": day_iso, "secid": t, "section": "up",
+                "effective_pct": effective, "model_pct": r["expected_open_pct"],
+                "news_alpha": alpha, "morning_pct": morn_,
+                "vol_ratio": morn_vol_ratio.get(t),
+                "confidence": conf, "status": status, "created_at": now_iso,
+            })
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
     else:
         lines.append("<b>Топ вверх</b>")
@@ -567,8 +578,40 @@ async def build_briefing(day: date | None = None) -> str:
             vf = _vol_flag(morn_vol_ratio.get(t))
             emoji = "🟢" if status == "усилено" else ""
             rows.append(_fmt_reinforced(t, effective, morn_, status, conf, vf, emoji, alpha))
+            saved_predictions.append({
+                "day": day_iso, "secid": t, "section": "down",
+                "effective_pct": effective, "model_pct": r["expected_open_pct"],
+                "news_alpha": alpha, "morning_pct": morn_,
+                "vol_ratio": morn_vol_ratio.get(t),
+                "confidence": conf, "status": status, "created_at": now_iso,
+            })
         lines.append("<pre>" + "\n".join(rows) + "</pre>")
         lines.append("")
+
+    # Persist predictions for evening evaluation
+    if saved_predictions:
+        with connect() as _conn:
+            for p in saved_predictions:
+                _conn.execute(
+                    """INSERT INTO briefing_predictions
+                        (day, secid, section, effective_pct, model_pct, news_alpha,
+                         morning_pct, vol_ratio, confidence, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(day, secid, section) DO UPDATE SET
+                         effective_pct=excluded.effective_pct,
+                         model_pct=excluded.model_pct,
+                         news_alpha=excluded.news_alpha,
+                         morning_pct=excluded.morning_pct,
+                         vol_ratio=excluded.vol_ratio,
+                         confidence=excluded.confidence,
+                         status=excluded.status,
+                         created_at=excluded.created_at""",
+                    (p["day"], p["secid"], p["section"], p["effective_pct"], p["model_pct"],
+                     p["news_alpha"], p["morning_pct"], p["vol_ratio"],
+                     p["confidence"], p["status"], p["created_at"]),
+                )
+            _conn.commit()
+        log.info("Сохранено прогнозов: %d", len(saved_predictions))
 
     # Разбор новостей: только для реально больших ходов (>2%)
     big_movers = set()

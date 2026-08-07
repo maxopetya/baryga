@@ -70,6 +70,36 @@ CREATE TABLE IF NOT EXISTS index_predictors (
     calibrated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS briefing_predictions (
+    day             TEXT NOT NULL,           -- YYYY-MM-DD (МСК)
+    secid           TEXT NOT NULL,
+    section         TEXT NOT NULL,           -- 'up' | 'down'
+    effective_pct   REAL,                    -- показанный прогноз (модель + news_alpha)
+    model_pct       REAL,                    -- сырой прогноз модели
+    news_alpha      REAL,                    -- вклад новостей
+    morning_pct     REAL,                    -- утренняя сессия к моменту брифинга
+    vol_ratio       REAL,                    -- утренний объём / вчерашний дневной
+    confidence      TEXT,                    -- высокая/средняя/низкая
+    status          TEXT,                    -- подтв/усилено/конфликт/только модель/…
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (day, secid, section)
+);
+
+CREATE TABLE IF NOT EXISTS briefing_evaluations (
+    day                TEXT NOT NULL,
+    secid              TEXT NOT NULL,
+    section            TEXT NOT NULL,
+    predicted_pct      REAL,                 -- effective_pct из briefing_predictions
+    actual_day_pct     REAL,                 -- close(D) vs close(D-1)
+    open_close_pct     REAL,                 -- open(D) vs prev close (гэп)
+    direction_correct  INTEGER,              -- 1 если знак совпал
+    magnitude_error_pp REAL,                 -- |predicted - actual| п.п.
+    attribution_url    TEXT,                 -- post-hoc найденная новость (если есть)
+    attribution_title  TEXT,
+    created_at         TEXT NOT NULL,
+    PRIMARY KEY (day, secid, section)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at   TEXT NOT NULL,
