@@ -226,41 +226,51 @@ def build_evening_report(day: date, results: list[dict]) -> str:
         lines.append(f"  {conf:8s}  {h}/{len(items)} = {h/len(items)*100:.0f}%")
     lines.append("")
 
-    # Топ попаданий (правильное направление, малая ошибка амплитуды)
-    good = [r for r in results if r["dir_ok"] and r["mag_err"] < 2.0]
-    good.sort(key=lambda r: abs(r["actual"]), reverse=True)  # самые крупные из попаданий
-    if good:
-        lines.append("<b>✅ Лучшие попадания</b>")
-        for r in good[:5]:
+    # Три чёткие категории вместо смешанной «крупные промахи»
+    bullseye = [r for r in results if r["dir_ok"] and r["mag_err"] < 2.0]
+    dir_right_amp_off = [r for r in results if r["dir_ok"] and r["mag_err"] >= 2.0]
+    dir_wrong = [r for r in results if not r["dir_ok"]]
+
+    def _fmt_row(r: dict) -> str:
+        base = f"• {r['secid']}  прог {r['predicted']:+.1f} → факт {r['actual']:+.1f}  ({r['confidence']})"
+        att = r.get("attribution")
+        if not att or not att.get("title"):
+            return base
+        url = att["url"]
+        src = "источник"
+        if url.startswith("http"):
+            domain = url.split("/")[2]
+            src_map = {
+                "www.kommersant.ru": "Ъ", "www.rbc.ru": "РБК",
+                "www.vedomosti.ru": "Вед", "www.interfax.ru": "И-факс",
+                "1prime.ru": "Прайм", "www.moex.com": "MOEX",
+                "smart-lab.ru": "smart-lab", "ru.investing.com": "Investing",
+                "t.me": "TG",
+            }
+            src = src_map.get(domain, domain)
+            if domain.startswith("t.me"):
+                src = "TG"
+        return f"{base}\n    причина: {att['title'][:100]} <a href=\"{url}\">{src}</a>"
+
+    if bullseye:
+        lines.append("<b>✅ Точные попадания</b>  <i>(направление верное, амплитуда в пределах 2 п.п.)</i>")
+        bullseye.sort(key=lambda r: abs(r["actual"]), reverse=True)
+        for r in bullseye[:5]:
             lines.append(f"• {r['secid']}  прог {r['predicted']:+.1f} → факт {r['actual']:+.1f}  ({r['status']})")
         lines.append("")
 
-    # Топ промахов
-    bad = [r for r in results if not r["dir_ok"] or r["mag_err"] > 3.0]
-    bad.sort(key=lambda r: r["mag_err"], reverse=True)
-    if bad:
-        lines.append("<b>❌ Крупные промахи</b>")
-        for r in bad[:6]:
-            base = f"• {r['secid']}  прог {r['predicted']:+.1f} → факт {r['actual']:+.1f}  ({r['confidence']})"
-            att = r.get("attribution")
-            if att and att.get("title"):
-                src = "источник"
-                url = att["url"]
-                if url.startswith("http"):
-                    domain = url.split("/")[2]
-                    src_map = {
-                        "www.kommersant.ru": "Ъ", "www.rbc.ru": "РБК",
-                        "www.vedomosti.ru": "Вед", "www.interfax.ru": "И-факс",
-                        "1prime.ru": "Прайм", "www.moex.com": "MOEX",
-                        "smart-lab.ru": "smart-lab", "ru.investing.com": "Investing",
-                    }
-                    src = src_map.get(domain, domain)
-                    if domain.startswith("t.me"):
-                        src = "TG"
-                lines.append(base)
-                lines.append(f"    причина: {att['title'][:100]} <a href=\"{url}\">{src}</a>")
-            else:
-                lines.append(f"{base}\n    причина: <i>не нашли новости, стоит проверить руками</i>")
+    if dir_right_amp_off:
+        lines.append("<b>↕️ Направление верно, амплитуду занизили/завысили</b>")
+        dir_right_amp_off.sort(key=lambda r: r["mag_err"], reverse=True)
+        for r in dir_right_amp_off[:5]:
+            lines.append(_fmt_row(r))
+        lines.append("")
+
+    if dir_wrong:
+        lines.append("<b>❌ Ошибка в направлении</b>")
+        dir_wrong.sort(key=lambda r: abs(r["actual"]) + r["mag_err"], reverse=True)
+        for r in dir_wrong[:5]:
+            lines.append(_fmt_row(r))
         lines.append("")
 
     lines.append("<i>Разбор идёт в БД для еженедельной калибровки news_alpha и порогов confidence.</i>")
