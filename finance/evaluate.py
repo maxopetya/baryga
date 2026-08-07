@@ -286,10 +286,19 @@ async def run_and_send(day: date, dry_run: bool = False) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", type=str, default=None, help="YYYY-MM-DD (по умолчанию сегодня МСК)")
+    ap.add_argument("--date", type=str, default=None, help="YYYY-MM-DD (по умолчанию — торговый день, чью сессию только что закрыли)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    day = date.fromisoformat(args.date) if args.date else datetime.now(MSK).date()
+    if args.date:
+        day = date.fromisoformat(args.date)
+    else:
+        now_msk = datetime.now(MSK)
+        # Если запуск в ночные часы МСК (после закрытия вечерки в 23:50) —
+        # оцениваем ТОЛЬКО ЧТО закрывшуюся сессию, т.е. вчерашний календарный день.
+        day = now_msk.date() if now_msk.hour >= 6 else now_msk.date() - timedelta(days=1)
+        # если попали на выходной — откатимся до последней пятницы
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
     asyncio.run(run_and_send(day, dry_run=args.dry_run))
 
 

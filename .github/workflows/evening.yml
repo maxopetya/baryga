@@ -2,8 +2,8 @@ name: Evening evaluation
 
 on:
   schedule:
-    # 16:15 UTC = 19:15 МСК, пн-пт (после закрытия MOEX в 18:50)
-    - cron: "15 16 * * 1-5"
+    # 21:30 UTC = 00:30 МСК следующего дня, пн-пт (после полного закрытия вечерней сессии в 23:50 МСК)
+    - cron: "30 21 * * 1-5"
   workflow_dispatch:
 
 concurrency:
