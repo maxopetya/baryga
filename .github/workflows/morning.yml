@@ -2,10 +2,11 @@ name: Morning briefing
 
 on:
   schedule:
-    # 06:30 UTC = 09:30 МСК, все дни (MOEX работает и в выходные, сессия 09:00-19:00).
-    # GitHub cron может задерживать до 10-15 мин.
-    - cron: "30 6 * * *"
-  workflow_dispatch:  # запуск руками из вкладки Actions
+    # 06:30 UTC = 09:30 МСК, пн-пт.
+    # MOEX работает и в выходные, но модель обучена на будних сессиях и в сб/вс
+    # даёт бесполезные прогнозы (тест на 08.08 показал 9% попадание).
+    - cron: "30 6 * * 1-5"
+  workflow_dispatch:
 
 concurrency:
   group: morning-briefing
