@@ -286,8 +286,7 @@ def _find_news_for_tickers(tickers: set[str], day: date) -> dict[str, dict | Non
     Возвращаем {ticker: {title, url}} или {ticker: None} если ничего вменяемого не нашли.
     """
     prev = day - timedelta(days=1)
-    while prev.weekday() >= 5:
-        prev -= timedelta(days=1)
+    # MOEX работает и в выходные — skip не нужен
     since = datetime.combine(prev, datetime.min.time(), MSK).replace(hour=6)
     until = datetime.combine(day, datetime.min.time(), MSK).replace(hour=10, minute=0)
     since_iso = since.astimezone(timezone.utc).isoformat(timespec="seconds")
@@ -328,8 +327,7 @@ def _news_alpha_map(day: date) -> dict[str, float]:
       3. Если по одному тикеру много новостей — берём самый сильный по модулю alpha
     """
     prev = day - timedelta(days=1)
-    while prev.weekday() >= 5:
-        prev -= timedelta(days=1)
+    # MOEX работает и в выходные — skip не нужен
     since = datetime.combine(prev, datetime.min.time(), MSK).replace(hour=18, minute=45)
     until = datetime.combine(day, datetime.min.time(), MSK).replace(hour=10, minute=0)
     since_iso = since.astimezone(timezone.utc).isoformat(timespec="seconds")
@@ -372,8 +370,7 @@ def _fetch_strong_news(day: date) -> list[dict]:
     """Ищем pre-open новости с сильным тегом И привязкой к конкретному тикеру."""
     # окно: 18:45 МСК предыдущего дня → 10:00 МСК day
     prev = day - timedelta(days=1)
-    while prev.weekday() >= 5:
-        prev -= timedelta(days=1)
+    # MOEX работает и в выходные — skip не нужен
     since = datetime.combine(prev, datetime.min.time(), MSK).replace(hour=18, minute=45)
     until = datetime.combine(day, datetime.min.time(), MSK).replace(hour=10, minute=0)
     since_iso = since.astimezone(timezone.utc).isoformat(timespec="seconds")

@@ -2,8 +2,9 @@ name: Morning briefing
 
 on:
   schedule:
-    # 06:30 UTC = 09:30 МСК, пн-пт. GitHub cron может задерживать до 10-15 мин.
-    - cron: "30 6 * * 1-5"
+    # 06:30 UTC = 09:30 МСК, все дни (MOEX работает и в выходные, сессия 09:00-19:00).
+    # GitHub cron может задерживать до 10-15 мин.
+    - cron: "30 6 * * *"
   workflow_dispatch:  # запуск руками из вкладки Actions
 
 concurrency:

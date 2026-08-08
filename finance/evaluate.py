@@ -303,12 +303,10 @@ def main() -> None:
         day = date.fromisoformat(args.date)
     else:
         now_msk = datetime.now(MSK)
-        # Если запуск в ночные часы МСК (после закрытия вечерки в 23:50) —
+        # Если запуск в ночные часы МСК (после закрытия сессии) —
         # оцениваем ТОЛЬКО ЧТО закрывшуюся сессию, т.е. вчерашний календарный день.
+        # MOEX работает и в выходные (одна сессия 09:00-19:00), поэтому weekend-skip не делаем.
         day = now_msk.date() if now_msk.hour >= 6 else now_msk.date() - timedelta(days=1)
-        # если попали на выходной — откатимся до последней пятницы
-        while day.weekday() >= 5:
-            day -= timedelta(days=1)
     asyncio.run(run_and_send(day, dry_run=args.dry_run))
 
 

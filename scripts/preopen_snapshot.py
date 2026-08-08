@@ -30,9 +30,7 @@ import asyncio
 def build(day_str: str) -> str:
     day = datetime.strptime(day_str, "%Y-%m-%d").date()
     # ищем предыдущий будний день (грубо: за 4 дня, чтобы после пятницы взять пт вечером)
-    prev = day - timedelta(days=1)
-    while prev.weekday() >= 5:  # суббота, воскресенье
-        prev -= timedelta(days=1)
+    prev = day - timedelta(days=1)  # MOEX работает и в выходные
     since = datetime.combine(prev, datetime.min.time(), MSK).replace(hour=18, minute=45)
     until = datetime.combine(day, datetime.min.time(), MSK).replace(hour=10, minute=0)
     # БД хранит published_at в ISO с UTC-суффиксом (+00:00) — сравниваем в UTC
